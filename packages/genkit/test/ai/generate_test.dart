@@ -13,6 +13,8 @@
 // limitations under the License.
 
 import 'package:genkit/genkit.dart';
+import 'package:genkit/src/ai/generate.dart'
+    show toToolDefinition, unwrapToolInput;
 import 'package:genkit/src/ai/tool_resolution.dart';
 import 'package:schemantic/schemantic.dart';
 import 'package:test/test.dart';
@@ -103,6 +105,118 @@ void main() {
       );
 
       expect(received, ToolChoice.required);
+    });
+
+    test('wraps a primitive tool inputSchema in an object for the model and '
+        'unwraps it before calling the tool', () async {
+      const modelName = 'primitiveToolModel';
+      Map<String, dynamic>? sentSchema;
+      Object? toolInput;
+
+      genkit.defineModel(
+        name: modelName,
+        fn: (request, context) async {
+          if (request.messages.last.role == .tool) {
+            return ModelResponse(
+              finishReason: .stop,
+              message: Message(
+                role: .model,
+                content: [TextPart(text: 'Done')],
+              ),
+            );
+          }
+          sentSchema = request.tools!.single.inputSchema;
+          return ModelResponse(
+            finishReason: .stop,
+            message: Message(
+              role: .model,
+              content: [
+                ToolRequestPart(
+                  toolRequest: ToolRequest(
+                    name: 'echo',
+                    input: {'input': 'hello'},
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      );
+
+      final echo = genkit.defineTool(
+        name: 'echo',
+        description: 'Echo a string back.',
+        inputSchema: .string(),
+        fn: (input, context) async {
+          toolInput = input;
+          return .response('echo: $input');
+        },
+      );
+
+      await genkit.generate(
+        model: modelRef(modelName),
+        prompt: 'Use echo',
+        tools: [echo],
+      );
+
+      expect(sentSchema!['type'], 'object');
+      expect(sentSchema!['required'], ['input']);
+      expect(
+        (sentSchema!['properties'] as Map)['input'],
+        containsPair('type', 'string'),
+      );
+      expect(toolInput, 'hello');
+    });
+
+    group('toToolDefinition input schema wrapping', () {
+      Map<String, dynamic> schemaOf(SchemanticType input) => toToolDefinition(
+        Tool<dynamic, String>(
+          name: 't',
+          description: 'd',
+          inputSchema: input,
+          fn: (input, context) async => .response('ok'),
+        ),
+      ).inputSchema!;
+
+      test('wraps integers and arrays', () {
+        expect(schemaOf(.integer())['type'], 'object');
+        expect(schemaOf(.list(.string()))['type'], 'object');
+      });
+
+      test('wraps nullable primitives', () {
+        final schema = schemaOf(.nullable(.string()));
+        expect(schema['type'], 'object');
+        expect(schema['required'], ['input']);
+      });
+
+      test('keeps definitions on the wrapper root', () {
+        final schema = schemaOf(.list(Message.$schema));
+        expect(schema['type'], 'object');
+        expect(schema, contains(r'$defs'));
+        final inner = (schema['properties'] as Map)['input'] as Map;
+        expect(inner, isNot(contains(r'$defs')));
+      });
+
+      test('leaves object schemas untouched', () {
+        final schema = schemaOf(TestToolInput.$schema);
+        expect(schema['properties'], isNot(contains('input')));
+        expect(schema['required'], isNot(['input']));
+      });
+
+      test('unwraps when the model adds stray keys', () async {
+        Object? received;
+        final tool = Tool<String, String>(
+          name: 't',
+          description: 'd',
+          inputSchema: .string(),
+          fn: (input, context) async {
+            received = input;
+            return .response('ok');
+          },
+        );
+        await tool.runRaw(unwrapToolInput(tool, {'input': 'x', 'extra': 1}));
+        expect(received, 'x');
+      });
     });
 
     test('should allow passing Tool objects directly', () async {
